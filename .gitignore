@@ -1,4 +1,5 @@
 apify_storage
+storage
 node_modules
 my_stuff
 package-lock.json
