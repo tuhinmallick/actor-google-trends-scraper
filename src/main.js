@@ -1,6 +1,13 @@
-const Apify = require('apify');
-
-const { log } = Apify.utils;
+const { Actor } = require('apify');
+const {
+    PuppeteerCrawler,
+    RequestQueue,
+    Dataset,
+    log,
+    sleep,
+    puppeteerUtils,
+    createRequestDebugInfo,
+} = require('crawlee');
 
 const {
     validateInput,
@@ -12,12 +19,9 @@ const {
     proxyConfiguration,
 } = require('./utils');
 
-// Do not remove this patch
-require('apify/build/constants').STATUS_CODES_BLOCKED = [401, 403];
-
-Apify.main(async () => {
+Actor.main(async () => {
     /** @type {any} */
-    const input = await Apify.getInput();
+    const input = await Actor.getInput();
     validateInput(input);
 
     const {
@@ -50,7 +54,7 @@ Apify.main(async () => {
         geo,
     );
     // open request queue
-    const requestQueue = await Apify.openRequestQueue();
+    const requestQueue = await RequestQueue.open();
 
     await requestQueue.addRequest({
         url: 'https://trends.google.com/trends', // hot start it
@@ -60,18 +64,18 @@ Apify.main(async () => {
     });
 
     // open dataset and get itemCount
-    const dataset = await Apify.openDataset();
+    const dataset = await Dataset.open();
     let { itemCount } = await dataset.getInfo();
 
     // if exists, evaluate extendOutputFunction, or throw
     checkAndEval(extendOutputFunction);
 
     // crawler config
-    const crawler = new Apify.PuppeteerCrawler({
+    const crawler = new PuppeteerCrawler({
         requestQueue,
         maxRequestRetries: 3,
         // needs some time to enqueue all the initial requests
-        handlePageTimeoutSecs: 300,
+        requestHandlerTimeoutSecs: 300,
         maxConcurrency,
         useSessionPool: true,
         sessionPoolOptions: {
@@ -79,8 +83,15 @@ Apify.main(async () => {
             sessionOptions: {
                 maxErrorScore: 5,
             },
+            // retire sessions on 401/403 instead of the v2 monkey-patch on apify/build/constants
+            blockedStatusCodes: [401, 403],
         },
         proxyConfiguration: proxyConfig,
+        launchContext: {
+            launchOptions: {
+                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+            },
+        },
         browserPoolOptions: {
             maxOpenPagesPerBrowser: 1,
         },
@@ -92,7 +103,7 @@ Apify.main(async () => {
         postNavigationHooks: [async ({ page }) => {
             await page.bringToFront();
         }],
-        handlePageFunction: async ({ page, request }) => {
+        requestHandler: async ({ page, request }) => {
             // if exists, check items limit. If limit is reached crawler will exit.
             if (maxItems && maxItemsCheck(maxItems, itemCount)) {
                 return;
@@ -100,7 +111,7 @@ Apify.main(async () => {
 
             const is429 = await page.evaluate(() => !!document.querySelector('div#af-error-container'));
             if (is429) {
-                await Apify.utils.sleep(10000);
+                await sleep(10000);
                 // eslint-disable-next-line no-throw-literal
                 throw 'Page got a 429 Error. Google is baiting us to throw out the proxy but we need to stick with it...';
             }
@@ -114,7 +125,7 @@ Apify.main(async () => {
                 }
             } else if (label === 'SEARCH') {
                 if (extendOutputFunction) {
-                    await Apify.utils.puppeteer.injectJQuery(page);
+                    await puppeteerUtils.injectJQuery(page);
                 }
                 // const searchTerm = decodeURIComponent(request.url.split('?')[1].split('=')[1]);
                 const queryStringObj = new URL(request.url);
@@ -151,10 +162,10 @@ Apify.main(async () => {
 
                     const result = await applyFunction(page, extendOutputFunction);
 
-                    await Apify.pushData({ ...resObject, ...result });
+                    await Actor.pushData({ ...resObject, ...result });
 
                     log.info(`The search term "${searchTerm}" displays no data.`);
-                    await Apify.utils.puppeteer.saveSnapshot(page, {
+                    await puppeteerUtils.saveSnapshot(page, {
                         key: `NO-DATA-${searchTerm.replace(/[^a-zA-Z0-9-_]/g, '-')}`,
                         saveHtml: false,
                     });
@@ -207,18 +218,18 @@ Apify.main(async () => {
                 const result = await applyFunction(page, extendOutputFunction);
 
                 // push, increase itemCount, log
-                await Apify.pushData({ ...resObject, ...result });
+                await Actor.pushData({ ...resObject, ...result });
 
                 itemCount++;
                 log.info(`Results for "${searchTerm}" pushed successfully.`);
             }
         },
 
-        handleFailedRequestFunction: async ({ request }) => {
+        failedRequestHandler: async ({ request }) => {
             log.warning(`Request ${request.url} failed too many times`);
 
             await dataset.pushData({
-                '#debug': Apify.utils.createRequestDebugInfo(request),
+                '#debug': createRequestDebugInfo(request),
             });
         },
     });

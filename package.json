@@ -3,8 +3,9 @@
     "version": "0.0.1",
     "description": "Google trends scraper",
     "dependencies": {
-        "puppeteer": "*",
-        "apify": "^2.1.0"
+        "apify": "^3.0.0",
+        "crawlee": "^3.0.0",
+        "puppeteer": "^22.15.0"
     },
     "scripts": {
         "start": "node src/main.js",
@@ -13,8 +14,8 @@
     "author": "emastra",
     "license": "Apache-2.0",
     "devDependencies": {
-        "@apify/eslint-config": "^0.1.4",
+        "@apify/eslint-config": "^0.4.0",
         "@types/lodash": "^4.14.172",
-        "eslint": "^7.32.0"
+        "eslint": "^8.0.0"
     }
 }

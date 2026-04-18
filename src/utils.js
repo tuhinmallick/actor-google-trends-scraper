@@ -1,6 +1,5 @@
-const Apify = require('apify');
-
-const { log } = Apify.utils;
+const { Actor } = require('apify');
+const { log } = require('crawlee');
 
 const { BASE_URL } = require('./constants');
 
@@ -70,7 +69,7 @@ function newUrl({ geo, timeRangeToUse, category, searchTerm }) {
 }
 
 async function checkAndCreateUrlSource(searchTerms, spreadsheetId, isPublic, timeRange, category, customTimeRange, geo) {
-    /** @type {Apify.RequestOptions[]} */
+    /** @type {import('crawlee').Source[]} */
     const sources = [];
     /** @type {any[]} */
     let output;
@@ -93,7 +92,7 @@ async function checkAndCreateUrlSource(searchTerms, spreadsheetId, isPublic, tim
 
     if (spreadsheetId) {
         log.info('Importing spreadsheet...');
-        const run = await Apify.call(
+        const run = await Actor.call(
             'lukaskrivka/google-sheets',
             {
                 mode: 'read',
@@ -236,19 +235,19 @@ function parseKeyAsIsoDate(key) {
  * @property {string[]} [params.hint] Hint specific proxy groups that should be used, like SHADER or RESIDENTIAL
  *
  * @param {params} params
- * @returns {Promise<Apify.ProxyConfiguration | undefined>}
+ * @returns {Promise<import('apify').ProxyConfiguration | undefined>}
  */
 const proxyConfiguration = async ({
     proxyConfig,
     required = true,
-    force = Apify.isAtHome(),
+    force = Actor.isAtHome(),
     blacklist = ['GOOGLESERP'],
     hint = [],
 }) => {
-    const configuration = await Apify.createProxyConfiguration(proxyConfig);
+    const configuration = await Actor.createProxyConfiguration(proxyConfig);
 
     // this works for custom proxyUrls
-    if (Apify.isAtHome() && required) {
+    if (Actor.isAtHome() && required) {
         if (!configuration || (!configuration.usesApifyProxy && (!configuration.proxyUrls || !configuration.proxyUrls.length)) || !configuration.newUrl()) {
             throw new Error(`\n=======\nYou're required to provide a valid proxy configuration\n\n=======`);
         }
@@ -264,7 +263,7 @@ const proxyConfiguration = async ({
 
             // specific non-automatic proxy groups like RESIDENTIAL, not an error, just a hint
             if (hint.length && !hint.some((group) => (configuration.groups || []).includes(group))) {
-                Apify.utils.log.info(`\n=======\nYou can pick specific proxy groups for better experience:\n\n*  ${hint.join('\n*  ')}\n\n=======`);
+                log.info(`\n=======\nYou can pick specific proxy groups for better experience:\n\n*  ${hint.join('\n*  ')}\n\n=======`);
             }
         }
     }
