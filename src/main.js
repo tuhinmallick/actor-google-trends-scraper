@@ -15,7 +15,6 @@ const {
     maxItemsCheck,
     checkAndEval,
     applyFunction,
-    parseKeyAsIsoDate,
     proxyConfiguration,
 } = require('./utils');
 
@@ -70,6 +69,10 @@ Actor.main(async () => {
     // if exists, evaluate extendOutputFunction, or throw
     checkAndEval(extendOutputFunction);
 
+    // Per-request promises for the widgetdata API response, keyed by request.uniqueKey.
+    // Set up in preNavigationHooks BEFORE navigation so the response is never missed.
+    const responseListeners = new Map();
+
     // crawler config
     const crawler = new PuppeteerCrawler({
         requestQueue,
@@ -96,9 +99,19 @@ Actor.main(async () => {
             maxOpenPagesPerBrowser: 1,
         },
         persistCookiesPerSession: true,
-        preNavigationHooks: [async (context, gotoOptions) => {
+        preNavigationHooks: [async ({ page, request }, gotoOptions) => {
             gotoOptions.timeout = pageLoadTimeoutSecs * 1000;
             gotoOptions.waitUntil = 'domcontentloaded';
+
+            // For SEARCH requests, capture the internal widgetdata/multiline API response
+            // before navigation starts so it's never missed if the XHR fires quickly.
+            if (request.userData?.label === 'SEARCH') {
+                const responsePromise = page.waitForResponse(
+                    (res) => res.url().includes('/trends/api/widgetdata/multiline'),
+                    { timeout: 125 * 1000 },
+                ).catch(() => null); // null = timed out (no data or very slow)
+                responseListeners.set(request.uniqueKey, responsePromise);
+            }
         }],
         postNavigationHooks: [async ({ page }) => {
             await page.bringToFront();
@@ -127,43 +140,36 @@ Actor.main(async () => {
                 if (extendOutputFunction) {
                     await puppeteerUtils.injectJQuery(page);
                 }
-                // const searchTerm = decodeURIComponent(request.url.split('?')[1].split('=')[1]);
+
                 const queryStringObj = new URL(request.url);
                 const searchTerm = queryStringObj.searchParams.get('q');
                 const terms = [...(searchTerm?.split(','))];
 
-                // The data are loading as well as the empty results error
-                // So we race between them so we don't wait unecessarily
+                // Retrieve the pre-registered API response promise and clean up the map
+                const responsePromise = responseListeners.get(request.uniqueKey) ?? Promise.resolve(null);
+                responseListeners.delete(request.uniqueKey);
 
-                // Returns false value if the empty selector is found
-                const waitForEmptyDataSelector = async () => {
-                    await page.waitForSelector('[widget-name=TIMESERIES]', { timeout: 30000 });
-                    await page.waitForFunction(async () => {
-                        const widget = document.querySelector('[widget-name=TIMESERIES]');
-                        return !!widget?.querySelector('p.widget-error-title');
-                    }, { timeout: 120 * 1000 });
-                    return false;
-                };
+                // Detects when the TIMESERIES widget shows a "no data" error instead of a chart.
+                // Resolves 'no-data' if the error title appears, or 'timeout' if neither fires.
+                const noDataPromise = page.waitForSelector('[widget-name=TIMESERIES]', { timeout: 30000 })
+                    .then(() => page.waitForFunction(() => {
+                        const w = document.querySelector('[widget-name=TIMESERIES]');
+                        return !!w?.querySelector('p.widget-error-title');
+                    }, { timeout: 120 * 1000 }))
+                    .then(() => ({ type: 'no-data' }))
+                    .catch(() => ({ type: 'timeout' }));
 
-                // Returns truhly value if the data selector is found
-                const waitForDataSelector = page.waitForSelector('svg ~ div > table > tbody tr', { timeout: 30000 });
-
-                // Evaluates either to boolean (false if empty data) or a truthly selector
-                const hasData = await Promise.race([
-                    waitForDataSelector,
-                    waitForEmptyDataSelector(),
+                // Race: internal JSON API response (data exists) vs no-data widget detection
+                const outcome = await Promise.race([
+                    responsePromise.then((r) => (r ? { type: 'data', response: r } : { type: 'timeout' })),
+                    noDataPromise,
                 ]);
 
-                // if no data, push message and return!
-                if (!hasData) {
+                if (outcome.type === 'no-data') {
                     const resObject = Object.create(null);
                     resObject[sheetTitle] = searchTerm;
                     resObject.message = 'The search term displays no data.';
-
-                    const result = await applyFunction(page, extendOutputFunction);
-
-                    await Actor.pushData({ ...resObject, ...result });
-
+                    await Actor.pushData({ ...resObject, ...await applyFunction(page, extendOutputFunction) });
                     log.info(`The search term "${searchTerm}" displays no data.`);
                     await puppeteerUtils.saveSnapshot(page, {
                         key: `NO-DATA-${searchTerm.replace(/[^a-zA-Z0-9-_]/g, '-')}`,
@@ -172,47 +178,40 @@ Actor.main(async () => {
                     return;
                 }
 
-                /**
-                 * @type {Array<[string, string[]]>}
-                 */
-                const results = await page.evaluate(() => {
-                    const trs = [...document.querySelectorAll('svg ~ div > table > tbody tr')].filter((el) => !el.closest('.hiddenDiv,bar-chart'));
+                if (outcome.type !== 'data') {
+                    throw new Error(`Timed out waiting for trends data for "${searchTerm}"`);
+                }
 
-                    // results is an array of arrays which contains in pos 0 the date, pos 1 the value
-                    return trs.map((tr) => {
-                        const result = [];
+                // Parse the internal API JSON — strip Google's XSSI protection prefix ")]}'\n"
+                const text = await outcome.response.text();
+                const json = JSON.parse(text.slice(5));
 
-                        const tds = Array.from(tr.children);
-                        /** @type {string[]} */
-                        const values = [];
+                /** @type {Array<{time: string, formattedTime: string, formattedAxisTime: string, value: number[], hasData: boolean[], formattedValue: string[]}>} */
+                const timelineData = json?.default?.timelineData ?? [];
 
-                        result.push(tds[0].textContent.trim());
+                if (!timelineData.length) {
+                    const resObject = Object.create(null);
+                    resObject[sheetTitle] = searchTerm;
+                    resObject.message = 'The search term displays no data.';
+                    await Actor.pushData({ ...resObject, ...await applyFunction(page, extendOutputFunction) });
+                    log.info(`The search term "${searchTerm}" displays no data (empty timeline).`);
+                    return;
+                }
 
-                        tds.slice(1).forEach((td) => {
-                            values.push(td.textContent.trim());
-                        });
-
-                        result.push(values);
-
-                        return result;
-                    });
-                });
-
-                // Prepare object to be pushed
                 const resObject = Object.create(null);
                 resObject[sheetTitle] = searchTerm;
 
-                for (const res of results) {
-                    // res[0] holds the date, res[1] holds the value. The date will be the name of the column when dataset is exported to spreadsheet
-                    let buf = Buffer.from(res[0]);
-                    if (buf.readUInt8(0) === 0xe2) {
-                        // google adds some unicode garbage to the data, chop both ends
-                        buf = buf.slice(3).slice(0, -3);
-                    }
+                for (const entry of timelineData) {
+                    // Skip sparse entries where Google has no data for this period
+                    if (!entry.hasData?.some(Boolean)) continue;
 
-                    const key = buf.toString();
-                    // same day keys are missing the year
-                    resObject[outputAsISODate ? parseKeyAsIsoDate(key) : key] = terms.map((_, index) => Number(res[1][index])).join(',');
+                    // formattedAxisTime matches the old DOM table format (e.g. "Nov 1, 2020")
+                    // formattedTime includes the full range (e.g. "Nov 1 – 7, 2020") as fallback
+                    const key = outputAsISODate
+                        ? new Date(Number(entry.time) * 1000).toISOString()
+                        : (entry.formattedAxisTime || entry.formattedTime);
+
+                    resObject[key] = terms.map((_, i) => entry.value[i] ?? 0).join(',');
                 }
 
                 const result = await applyFunction(page, extendOutputFunction);
